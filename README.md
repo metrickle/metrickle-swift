@@ -2,7 +2,7 @@
 
 Native Swift SDK for [Metrickle](https://metrickle.com): UX research and conversion analytics, accessibility first. It records screens, journeys and friction (rage taps, U-turns, form errors), segments everything by the assistive tech and accessibility settings people use, and runs in-app surveys in an accessible native sheet.
 
-It follows the same contract as the web, React Native, Android and Flutter SDKs (`docs/NATIVE_SDKS.md`), so a funnel, task or survey means the same thing on every platform.
+It follows the same [event model](https://metrickle.com/developers/events) as the web, React Native, Android and Flutter SDKs, so a funnel, task or survey means the same thing on every platform.
 
 - iOS 15+ (builds on macOS 12+ for tests), Swift 6 language mode, no dependencies
 - UIKit and SwiftUI
@@ -19,7 +19,7 @@ https://github.com/metrickle/metrickle-swift
 or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/metrickle/metrickle-swift", from: "0.1.0"),
+.package(url: "https://github.com/metrickle/metrickle-swift", from: "0.2.0"),
 // ...
 .target(name: "MyApp", dependencies: [.product(name: "Metrickle", package: "metrickle-swift")]),
 ```
@@ -80,11 +80,22 @@ mk.screen("Onboarding step 2")            // manual screen, e.g. for custom cont
 mk.identify("user_123", traits: ["plan": "pro"])
 mk.register(["experiment": "b"])            // added to every later event
 mk.formError(form: "signup", field: "email", reason: "format") // field ids only, never what was typed
-mk.reset()                                  // on logout: new anonymous id and session
+mk.reset()                                  // on logout: new anonymous id (none while opted out) and session
 mk.flush()
 ```
 
 Property values are strings (up to 1024 characters), numbers, booleans or `nil`, at most 64 per event. Names starting with `$` are reserved.
+
+## Revenue from Stripe or RevenueCat
+
+Connect your RevenueCat project (or Stripe account) in the Metrickle dashboard under Integrations → Revenue. Purchases, renewals, refunds and cancels then arrive server-side on the person you identified, so a refund takes back the task they completed. Log in to RevenueCat with the same id:
+
+```swift
+mk.identify(user.id)
+_ = try await Purchases.shared.logIn(user.id)
+// Or keep RevenueCat's id and name the Metrickle user:
+// Purchases.shared.attribution.setAttributes(["metrickle_user_id": user.id])
+```
 
 ## Options
 
@@ -139,6 +150,7 @@ On by default. The sheet is presented on the top-most view controller and is des
 - Choice questions use toggles (multiple answers) or a list of selectable rows (single answer). Text questions have a visible label and a multiline field.
 - Dynamic Type with no truncation (it scrolls, opens at full height for accessibility sizes, and stacks buttons), dark mode, Increase Contrast via semantic colours, and Reduce Motion (presented without animation).
 - A visible Close button; swipe down, Escape and the VoiceOver escape gesture also dismiss it. It ends with your thank-you message or "Thanks for your feedback".
+- When the campaign has a follow-up and the response qualifies, the submit button says "One moment…" (focus stays on it) while the sheet asks for the person's study link, for up to 5 seconds. With a link it shows the invite (below); otherwise the thank-you.
 - Your brand accent (`branding.accent`) is used for fills only when it reaches 4.5:1 against the sheet background; otherwise the app's tint colour is used. Text on fills is white when it reaches 4.5:1, otherwise black (`textOn`, as on the web).
 
 ```swift
@@ -163,6 +175,34 @@ let stop = Metrickle.shared?.surveys.onShow { survey in
 
 Answers become `$survey_shown`, `$survey_answered` and `$survey_dismissed` events, so responses join journeys and funnels.
 
+### Follow-ups (study invites)
+
+A campaign can invite the people who answered into a study: a booked video call (moderated) or a self-guided test on the web (unmoderated). The campaign then carries `survey.followUp` (`studyId`, `kind`, `prompt`, optional `when`, `incentive`, `durationMin`), only while the study is recruiting. `when` limits it to certain answers, for example NPS 0–6 or a particular choice.
+
+The built-in sheet handles all of this. After the last answer it shows the invite: your prompt as a heading (VoiceOver focus moves to it), what taking part involves ("A 30-minute video call at a time that suits you." or "A short self-guided test of the site. Takes about 10–15 minutes."), any incentive ("As a thank-you: …"), and two buttons: "No thanks" and "Choose a time" (moderated) or "Take part" (unmoderated). The second opens the person's link in the browser and says so to VoiceOver. The invite never closes on its own.
+
+With your own renderer:
+
+```swift
+Metrickle.shared?.surveys.onShow { survey in
+    // ... ask the questions, calling survey.answer(_:_:) for each, then:
+    survey.complete()
+    guard survey.followUp != nil, survey.qualifies() else { return showThanks() }
+    Task { @MainActor in
+        guard let url = await survey.invite() else { return showThanks() } // nil: full, closed, or offline
+        showInvite(survey.followUp!, onAccept: {
+            survey.followUpAccepted()
+            UIApplication.shared.open(url)
+        })
+        survey.followUpOffered() // once the invite is on screen
+    }
+}
+```
+
+- `qualifies()`: whether this response's answers meet `followUp.when` (always true without one; false with no follow-up).
+- `invite()`: the person's personal study link. It asks the server once per response (later calls return the same answer) and returns nil when there's no follow-up, the response doesn't qualify, the user opted out, the study is full or no longer recruiting, the link isn't https, or the request fails. Only show an invite you have a link for.
+- `followUpOffered()` / `followUpAccepted()`: each records `$survey_follow_up` once per response (`study`, `accepted: false` / `true`), so you can see how many people were asked and how many said yes.
+
 ## Feedback
 
 ```swift
@@ -184,7 +224,8 @@ The session, current screen, app version, device, screen size, locale and access
 
 - No IDFA, IDFV or device serials. `anonymousId` is a random UUID stored in the app's `com.metrickle` UserDefaults suite and removed with the app. The model identifier (for example `iPhone15,2`) identifies a hardware model, not a device.
 - Text field contents are never captured, only identifiers you pass.
-- `optOut()` clears the queue, stops collection and makes no further network calls (including config and feedback) until `optIn()`. The choice is persisted.
+- `optOut()` clears the queue, stops collection, removes the anonymous id and session from the device, and makes no further network calls (including config, feedback and study invites) until `optIn()`. The choice is persisted. While opted out no anonymous id is created, at launch or on `reset()`. Your own user id from `identify()` and the consent choice are kept.
+- `optIn()` creates a new anonymous id and fetches surveys and settings again.
 - Cookieless mode stores no ids at all.
 - `consent(replay:)` records consent for session replay (not available on iOS yet; kept for parity with the web SDK).
 - Unsent events (at most 1000) are kept on disk so they survive the app being killed; events older than 7 days are never sent.

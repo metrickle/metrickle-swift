@@ -189,4 +189,197 @@ final class SurveysTests: XCTestCase {
         XCTAssertFalse(transport.events.contains { $0.name.hasPrefix("$survey_") })
         client.stopTimer()
     }
+
+    // MARK: Follow-ups
+
+    /// Same vectors as "follow-up matching" in surveys.test.ts.
+    func testFollowUpMatches() {
+        let nps = FollowUpWhen(questionId: "nps", min: 0, max: 6)
+        let cases: [(FollowUpWhen?, [String: Answer], Bool)] = [
+            (nil, [:], true),
+            (nps, ["nps": Answer(score: 3)], true),
+            (nps, ["nps": Answer(score: 0)], true),
+            (nps, ["nps": Answer(score: 6)], true),
+            (nps, ["nps": Answer(score: 7)], false),
+            (FollowUpWhen(questionId: "nps", min: 9), ["nps": Answer(score: 10)], true),
+            (nps, [:], false),
+            (nps, ["nps": Answer()], false),
+            (FollowUpWhen(questionId: "why", choices: ["Price", "Speed"]), ["why": Answer(values: ["Speed", "Other"])], true),
+            (FollowUpWhen(questionId: "why", choices: ["Price"]), ["why": Answer(values: ["Speed"])], false),
+            (FollowUpWhen(questionId: "why", choices: ["Price"]), ["why": Answer(score: 3)], false),
+        ]
+        for (i, (when, answers, expected)) in cases.enumerated() {
+            XCTAssertEqual(followUpMatches(when, answers), expected, "case \(i)")
+        }
+    }
+
+    func testFollowUpDecodingIsLossy() throws {
+        let json = #"""
+        {"v":1,"campaigns":[
+          {"id":"a","version":1,"questions":[{"id":"nps","type":"nps","prompt":"?"}],"targeting":{"trigger":{"kind":"load"}},
+           "followUp":{"studyId":"std_1","kind":"moderated","prompt":"Talk to us?","when":{"questionId":"nps","max":6},"incentive":"A £20 voucher","durationMin":30}},
+          {"id":"b","version":1,"questions":[{"id":"nps","type":"nps","prompt":"?"}],"targeting":{"trigger":{"kind":"load"}},
+           "followUp":{"studyId":"std_2","kind":"hologram","prompt":"?"}},
+          {"id":"c","version":1,"questions":[{"id":"nps","type":"nps","prompt":"?"}],"targeting":{"trigger":{"kind":"load"}},"followUp":"nonsense"}
+        ]}
+        """#
+        let cfg = try JSONDecoder().decode(SdkConfig.self, from: Data(json.utf8))
+        XCTAssertEqual(cfg.campaigns.map(\.id), ["a", "b", "c"])
+        XCTAssertEqual(cfg.campaigns[0].followUp, FollowUpConfig(
+            studyId: "std_1", kind: .moderated, prompt: "Talk to us?", when: FollowUpWhen(questionId: "nps", max: 6),
+            incentive: "A £20 voucher", durationMin: 30))
+        XCTAssertNil(cfg.campaigns[1].followUp)
+        XCTAssertNil(cfg.campaigns[2].followUp)
+    }
+
+    func testFollowUpCopyMatchesWeb() {
+        XCTAssertEqual(followUpDescription(FollowUpConfig(studyId: "s", kind: .moderated, prompt: "?", durationMin: 30)),
+                       "A 30-minute video call at a time that suits you.")
+        XCTAssertEqual(followUpDescription(FollowUpConfig(studyId: "s", kind: .moderated, prompt: "?")),
+                       "A video call at a time that suits you.")
+        XCTAssertEqual(followUpDescription(FollowUpConfig(studyId: "s", kind: .unmoderated, prompt: "?")),
+                       "A short self-guided test of the site. Takes about 10–15 minutes.")
+    }
+
+    func testSafeInviteURL() {
+        XCTAssertEqual(safeInviteURL("https://app.example.com/s/abc", host: "https://in.example.com")?.absoluteString, "https://app.example.com/s/abc")
+        XCTAssertNil(safeInviteURL("http://app.example.com/s/abc", host: "https://in.example.com"))
+        XCTAssertNotNil(safeInviteURL("http://localhost:8787/s/abc", host: "http://localhost:8787"))
+        XCTAssertNil(safeInviteURL("javascript:alert(1)", host: "http://localhost:8787"))
+        XCTAssertNil(safeInviteURL(nil, host: "https://in.example.com"))
+        XCTAssertNil(safeInviteURL("not a url", host: "https://in.example.com"))
+    }
+
+    private func followUpSurvey(_ followUp: FollowUpConfig?, transport: RecordingTransport,
+                                host: String = "https://in.example.com") async throws -> (Metrickle, ActiveSurvey) {
+        let client = makeClient(transport: transport, options: .init(host: host, flushInterval: 3600))
+        let shown = expectation(description: "shown")
+        let box = Locked<ActiveSurvey?>(nil)
+        client.surveys.onShow { s in box.set(s); shown.fulfill() }
+        var c = campaign()
+        c.followUp = followUp
+        let config = SdkConfig(campaigns: [c])
+        client.q.async { client.apply(config) }
+        await fulfillment(of: [shown], timeout: 2)
+        return (client, try XCTUnwrap(box.get()))
+    }
+
+    func testQualifyingResponseGetsLinkAndRecordsFollowUpOnce() async throws {
+        let transport = RecordingTransport()
+        transport.invite = (201, Data(#"{"url":"https://app.example.com/s/abc"}"#.utf8))
+        let fu = FollowUpConfig(studyId: "std_1", kind: .moderated, prompt: "Talk to us?",
+                                when: FollowUpWhen(questionId: "nps", max: 6), durationMin: 30)
+        let (client, s) = try await followUpSurvey(fu, transport: transport)
+        client.identify("user-9")
+        s.shown()
+        s.answer(s.campaign.questions[0], Answer(score: 4))
+        s.complete()
+        XCTAssertEqual(s.followUp?.studyId, "std_1")
+        XCTAssertTrue(s.qualifies())
+        let url = await s.invite()
+        XCTAssertEqual(url?.absoluteString, "https://app.example.com/s/abc")
+        // Asked once per response, however often the renderer calls it.
+        let again = await s.invite(timeout: 5)
+        XCTAssertEqual(again, url)
+        let invites = transport.requests.filter { $0.url?.path == "/v1/studies/invite" }
+        XCTAssertEqual(invites.count, 1)
+        let req = try XCTUnwrap(invites.first)
+        XCTAssertEqual(req.url?.absoluteString, "https://in.example.com/v1/studies/invite")
+        XCTAssertEqual(req.httpMethod, "POST")
+        XCTAssertEqual(req.value(forHTTPHeaderField: "x-metrickle-key"), "k")
+        XCTAssertEqual(req.value(forHTTPHeaderField: "content-type"), "application/json")
+        XCTAssertEqual(req.value(forHTTPHeaderField: "User-Agent"), client.onQueue { client.userAgent })
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(req.httpBody)) as? [String: String])
+        XCTAssertEqual(body, [
+            "writeKey": "k", "studyId": "std_1", "campaignId": "cmp_1", "response": s.response,
+            "anonymousId": try XCTUnwrap(client.identity.anonymousId), "userId": "user-9",
+        ])
+
+        s.followUpOffered()
+        s.followUpOffered()
+        s.followUpAccepted()
+        s.followUpAccepted()
+        await client.flushNow()
+        let fuEvents = transport.events.filter { $0.name == "$survey_follow_up" }.map(\.properties)
+        XCTAssertEqual(fuEvents, [
+            ["campaign": "cmp_1", "version": 1, "response": .string(s.response), "study": "std_1", "accepted": false],
+            ["campaign": "cmp_1", "version": 1, "response": .string(s.response), "study": "std_1", "accepted": true],
+        ])
+        client.stopTimer()
+    }
+
+    func testNoInviteWhenNotQualifyingFullUnsafeOrMissing() async throws {
+        let fu = FollowUpConfig(studyId: "std_1", kind: .unmoderated, prompt: "Try it?", when: FollowUpWhen(questionId: "nps", max: 6))
+
+        // Not qualifying: no request at all.
+        let ta = RecordingTransport()
+        let (a, sa) = try await followUpSurvey(fu, transport: ta)
+        sa.answer(sa.campaign.questions[0], Answer(score: 9))
+        XCTAssertFalse(sa.qualifies())
+        let ua = await sa.invite()
+        XCTAssertNil(ua)
+        XCTAssertFalse(ta.requests.contains { $0.url?.path == "/v1/studies/invite" })
+        a.stopTimer()
+
+        // 409 study_full.
+        let tb = RecordingTransport()
+        tb.invite = (409, Data(#"{"error":"study_full"}"#.utf8))
+        let (b, sb) = try await followUpSurvey(fu, transport: tb)
+        sb.answer(sb.campaign.questions[0], Answer(score: 2))
+        let ub = await sb.invite()
+        XCTAssertNil(ub)
+        b.stopTimer()
+
+        // 201 with an unsafe link, and 200 with a good one: neither is used.
+        for (status, link) in [(201, "javascript:alert(1)"), (201, "http://app.example.com/s/abc"), (200, "https://app.example.com/s/abc")] {
+            let t = RecordingTransport()
+            t.invite = (status, Data(#"{"url":"\#(link)"}"#.utf8))
+            let (c, sc) = try await followUpSurvey(fu, transport: t)
+            sc.answer(sc.campaign.questions[0], Answer(score: 2))
+            let u = await sc.invite()
+            XCTAssertNil(u, "\(status) \(link)")
+            c.stopTimer()
+        }
+
+        // Network error.
+        let te = RecordingTransport()
+        te.invite = (-1, Data())
+        let (e, se) = try await followUpSurvey(fu, transport: te)
+        se.answer(se.campaign.questions[0], Answer(score: 2))
+        let ue = await se.invite()
+        XCTAssertNil(ue)
+        e.stopTimer()
+
+        // http link is fine when the SDK itself talks to an http host (local testing).
+        let tl = RecordingTransport()
+        tl.invite = (201, Data(#"{"url":"http://localhost:8787/s/abc"}"#.utf8))
+        let (l, sl) = try await followUpSurvey(fu, transport: tl, host: "http://localhost:8787")
+        sl.answer(sl.campaign.questions[0], Answer(score: 2))
+        let ul = await sl.invite()
+        XCTAssertEqual(ul?.absoluteString, "http://localhost:8787/s/abc")
+        l.stopTimer()
+
+        // Opted out: no request.
+        let to = RecordingTransport()
+        to.invite = (201, Data(#"{"url":"https://app.example.com/s/abc"}"#.utf8))
+        let (o, so) = try await followUpSurvey(fu, transport: to)
+        so.answer(so.campaign.questions[0], Answer(score: 2))
+        o.optOut()
+        let uo = await so.invite()
+        XCTAssertNil(uo)
+        XCTAssertFalse(to.requests.contains { $0.url?.path == "/v1/studies/invite" })
+        o.stopTimer()
+
+        // No follow-up configured: nothing to offer, nothing recorded.
+        let td = RecordingTransport()
+        let (d, sd) = try await followUpSurvey(nil, transport: td)
+        XCTAssertFalse(sd.qualifies())
+        let ud = await sd.invite()
+        XCTAssertNil(ud)
+        sd.followUpOffered()
+        sd.followUpAccepted()
+        await d.flushNow()
+        XCTAssertFalse(td.events.contains { $0.name == "$survey_follow_up" })
+        d.stopTimer()
+    }
 }

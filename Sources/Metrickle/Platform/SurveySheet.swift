@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 enum BuiltInSurveySheet {
     /// The built-in renderer, or nil where there is no UIKit.
@@ -10,6 +15,24 @@ enum BuiltInSurveySheet {
         #else
         return nil
         #endif
+    }
+}
+
+/// Opens a study link in the system browser.
+@MainActor
+func openInBrowser(_ url: URL) {
+    #if canImport(UIKit) && !os(watchOS)
+    UIApplication.shared.open(url)
+    #elseif canImport(AppKit)
+    NSWorkspace.shared.open(url)
+    #endif
+}
+
+/// What the invite says taking part involves (same copy as the web card).
+func followUpDescription(_ f: FollowUpConfig) -> String {
+    switch f.kind {
+    case .moderated: "A \(f.durationMin.map { "\($0)-minute " } ?? "")video call at a time that suits you."
+    case .unmoderated: "A short self-guided test of the site. Takes about 10–15 minutes."
     }
 }
 
@@ -96,13 +119,19 @@ extension UIColor {
 final class SurveySheetModel: NSObject, ObservableObject, UIAdaptivePresentationControllerDelegate {
     let survey: ActiveSurvey
     var close: () -> Void = {}
+    enum Screen: Equatable { case question, invite(URL), thanks }
+
     @Published var index = 0
-    @Published var done = false
+    @Published var screen = Screen.question
+    /// Waiting for the study link after the last answer; the submit button says "One moment…".
+    @Published var waiting = false
     @Published var score: Int?
     @Published var selected: [String] = []
     @Published var text = ""
     @Published var error: String?
     private var finished = false
+    /// `survey.complete()` was called: closing now records no dismissal.
+    private var completed = false
 
     init(survey: ActiveSurvey) { self.survey = survey }
 
@@ -111,6 +140,7 @@ final class SurveySheetModel: NSObject, ObservableObject, UIAdaptivePresentation
     var isLast: Bool { index == questions.count - 1 }
 
     func submit() {
+        guard !waiting else { return }
         let q = question
         let answer: Answer?
         switch q.type {
@@ -128,13 +158,32 @@ final class SurveySheetModel: NSObject, ObservableObject, UIAdaptivePresentation
         advance()
     }
 
-    func skip() { advance() }
+    func skip() {
+        guard !waiting else { return }
+        advance()
+    }
 
     private func advance() {
         error = nil
         if isLast {
-            done = true
+            completed = true
             survey.complete()
+            guard survey.followUp != nil, survey.qualifies() else { screen = .thanks; return }
+            // Ask for the personal link before saying anything: no invite is shown that can't be kept.
+            // Focus stays on the submit button meanwhile.
+            waiting = true
+            UIAccessibility.post(notification: .announcement, argument: "One moment…")
+            Task { @MainActor in
+                let url = await survey.invite(timeout: 5)
+                waiting = false
+                guard !finished else { return }
+                if let url {
+                    screen = .invite(url)
+                    survey.followUpOffered()
+                } else {
+                    screen = .thanks
+                }
+            }
         } else {
             index += 1
             score = nil
@@ -150,6 +199,14 @@ final class SurveySheetModel: NSObject, ObservableObject, UIAdaptivePresentation
         error = nil
     }
 
+    func declineInvite() { screen = .thanks }
+
+    func acceptInvite(_ url: URL) {
+        survey.followUpAccepted()
+        openInBrowser(url)
+        screen = .thanks
+    }
+
     func dismissTapped() {
         finish()
         close()
@@ -161,12 +218,12 @@ final class SurveySheetModel: NSObject, ObservableObject, UIAdaptivePresentation
     private func finish() {
         guard !finished else { return }
         finished = true
-        if !done { survey.dismiss(atIndex: index) }
+        if !completed { survey.dismiss(atIndex: index) }
     }
 }
 
 struct SurveySheetView: View {
-    enum Focus: Hashable { case heading, prompt, thanks }
+    enum Focus: Hashable { case heading, prompt, invite, thanks }
 
     @ObservedObject var model: SurveySheetModel
     let palette: SurveyPalette
@@ -181,7 +238,11 @@ struct SurveySheetView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    if model.done { thanks } else { question(model.question) }
+                    switch model.screen {
+                    case .question: question(model.question)
+                    case .invite(let url): invite(url)
+                    case .thanks: thanks
+                    }
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -192,7 +253,13 @@ struct SurveySheetView: View {
         .accessibilityAction(.escape) { model.dismissTapped() }
         .onAppear { moveFocus(.heading, after: 0.6) }
         .onChange(of: model.index) { _ in moveFocus(.prompt) }
-        .onChange(of: model.done) { _ in moveFocus(.thanks) }
+        .onChange(of: model.screen) { screen in
+            switch screen {
+            case .question: break
+            case .invite: moveFocus(.invite)
+            case .thanks: moveFocus(.thanks)
+            }
+        }
     }
 
     private func moveFocus(_ target: Focus, after seconds: Double = 0.2) {
@@ -209,7 +276,7 @@ struct SurveySheetView: View {
                     .font(.headline)
                     .accessibilityAddTraits(.isHeader)
                     .accessibilityFocused($focus, equals: .heading)
-                if model.questions.count > 1 && !model.done {
+                if model.questions.count > 1 && model.screen == .question {
                     Text("Question \(model.index + 1) of \(model.questions.count)").font(.subheadline)
                 }
             }
@@ -355,7 +422,7 @@ struct SurveySheetView: View {
     @ViewBuilder
     private func actions(_ q: Question) -> some View {
         let primary = Button(action: model.submit) {
-            Text(model.isLast ? "Submit" : "Next")
+            Text(model.waiting ? "One moment…" : model.isLast ? "Submit" : "Next")
                 .font(.body.weight(.semibold))
                 .foregroundColor(palette.onAccent)
                 .padding(.horizontal, 20)
@@ -383,6 +450,60 @@ struct SurveySheetView: View {
                 Spacer(minLength: 0)
                 if !q.required { skip }
                 primary
+            }
+        }
+    }
+
+    /// The study invite: the prompt as a focused heading, what taking part involves, any incentive, and a choice.
+    /// It never closes on its own.
+    private func invite(_ url: URL) -> some View {
+        let fu = model.survey.followUp
+        let action = fu?.kind == .moderated ? "Choose a time" : "Take part"
+        let accept = Button { model.acceptInvite(url) } label: {
+            Text(action)
+                .font(.body.weight(.semibold))
+                .foregroundColor(palette.onAccent)
+                .padding(.horizontal, 20)
+                .frame(maxWidth: typeSize.isAccessibilitySize ? .infinity : nil, minHeight: 44)
+                .background(Capsule().fill(palette.accent))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(action), opens in your browser")
+        let decline = Button(action: model.declineInvite) {
+            Text("No thanks")
+                .font(.body.weight(.semibold))
+                .padding(.horizontal, 20)
+                .frame(maxWidth: typeSize.isAccessibilitySize ? .infinity : nil, minHeight: 44)
+                .overlay(Capsule().strokeBorder(Color(UIColor.secondaryLabel)))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        return VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(fu?.prompt ?? "")
+                    .font(.title3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.isHeader)
+                    .accessibilityFocused($focus, equals: .invite)
+                if let fu {
+                    Text(followUpDescription(fu)).fixedSize(horizontal: false, vertical: true)
+                    if let incentive = fu.incentive, !incentive.isEmpty {
+                        Text("As a thank-you: \(incentive)").fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            if typeSize.isAccessibilitySize {
+                VStack(spacing: 12) {
+                    accept
+                    decline
+                }
+            } else {
+                HStack(spacing: 12) {
+                    Spacer(minLength: 0)
+                    decline
+                    accept
+                }
             }
         }
     }

@@ -21,11 +21,23 @@ public struct Answer: Sendable, Equatable {
 public final class ActiveSurvey: @unchecked Sendable, Identifiable {
     public let campaign: CampaignConfig
     public var id: String { response }
+    /// The campaign's follow-up: an invite into a study (a booked video call or a self-guided test), offered after the
+    /// last answer when `qualifies()`. Nil when the campaign has none or the study isn't recruiting.
+    public var followUp: FollowUpConfig? { campaign.followUp }
     let response: String
     let path: String?
     weak var engine: SurveyEngine?
     /// Answers given so far (engine queue only).
     var answered = 0
+
+    private struct FollowUpState {
+        /// This response's answers by question, for the follow-up condition.
+        var answers: [String: Answer] = [:]
+        var invite: Task<URL?, Never>?
+        var offered = false
+        var accepted = false
+    }
+    private let state = Locked(FollowUpState())
 
     init(campaign: CampaignConfig, response: String, path: String?, engine: SurveyEngine) {
         self.campaign = campaign; self.response = response; self.path = path; self.engine = engine
@@ -33,11 +45,62 @@ public final class ActiveSurvey: @unchecked Sendable, Identifiable {
 
     /// Call once the survey is actually on screen.
     public func shown() { engine?.perform { $0.shown(self) } }
-    public func answer(_ question: Question, _ answer: Answer) { engine?.perform { $0.answer(self, question, answer) } }
+    public func answer(_ question: Question, _ answer: Answer) {
+        state.update { $0.answers[question.id] = answer }
+        engine?.perform { $0.answer(self, question, answer) }
+    }
     /// Call after the last answer.
     public func complete() { engine?.perform { $0.complete(self) } }
     /// The user closed it; `atIndex` is the question they were on.
     public func dismiss(atIndex: Int) { engine?.perform { $0.dismiss(self, at: atIndex) } }
+
+    /// Whether this response qualifies for the follow-up (false when there is none). Call after the last answer.
+    public func qualifies() -> Bool {
+        guard let followUp else { return false }
+        return followUpMatches(followUp.when, state.get().answers)
+    }
+
+    /// The respondent's personal study link, or nil (no follow-up, not qualifying, opted out, the study is full, or
+    /// any error). Asks the server at most once per response, however often it's called. Show the invite only when
+    /// this returns a link.
+    public func invite() async -> URL? {
+        guard let followUp, qualifies(), let client = engine?.client, !client.isOptedOut else { return nil }
+        let task = state.update { s -> Task<URL?, Never> in
+            if let t = s.invite { return t }
+            let t = Task { await client.requestInvite(studyId: followUp.studyId, campaignId: self.campaign.id, response: self.response) }
+            s.invite = t
+            return t
+        }
+        return await task.value
+    }
+
+    /// `invite()`, or nil if it takes longer than `seconds` (the built-in sheet waits 5s).
+    func invite(timeout seconds: Double) async -> URL? {
+        await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
+            let done = Locked(false)
+            let finish: @Sendable (URL?) -> Void = { url in
+                if done.update({ d -> Bool in defer { d = true }; return !d }) { cont.resume(returning: url) }
+            }
+            Task { finish(await self.invite()) }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                finish(nil)
+            }
+        }
+    }
+
+    /// Call when the invite is on screen. Sends `$survey_follow_up` with `accepted: false`, once per response.
+    public func followUpOffered() {
+        guard followUp != nil, state.update({ s -> Bool in defer { s.offered = true }; return !s.offered }) else { return }
+        engine?.perform { $0.followUp(self, accepted: false) }
+    }
+
+    /// Call when the respondent takes up the invite (before opening the link). Sends `$survey_follow_up` with
+    /// `accepted: true`, once per response.
+    public func followUpAccepted() {
+        guard followUp != nil, state.update({ s -> Bool in defer { s.accepted = true }; return !s.accepted }) else { return }
+        engine?.perform { $0.followUp(self, accepted: true) }
+    }
 }
 
 public typealias SurveyRenderer = @MainActor @Sendable (ActiveSurvey) -> Void
@@ -158,6 +221,22 @@ func eligible(_ c: CampaignConfig, _ ctx: EligibilityContext, _ state: SurveySta
     case .recurring:
         return ctx.now - shown >= days
     }
+}
+
+/// Port of `followUpMatches` (`@metrickle/schema`): whether this response's answers meet the follow-up condition.
+/// Choice conditions match any listed answer; score conditions are an inclusive band. No condition matches everyone.
+func followUpMatches(_ when: FollowUpWhen?, _ answers: [String: Answer]) -> Bool {
+    guard let when else { return true }
+    guard let a = answers[when.questionId] else { return false }
+    if let choices = when.choices, !choices.isEmpty { return a.values?.contains(where: choices.contains) ?? false }
+    guard let score = a.score.map(Double.init) else { return false }
+    return (when.min.map { score >= $0 } ?? true) && (when.max.map { score <= $0 } ?? true)
+}
+
+/// A study link is only opened when it's https (or http when the SDK itself talks to an http host, for local testing).
+func safeInviteURL(_ raw: String?, host: String) -> URL? {
+    guard let raw, let url = URL(string: raw), let scheme = url.scheme?.lowercased(), url.host != nil else { return nil }
+    return scheme == "https" || (scheme == "http" && host.lowercased().hasPrefix("http:")) ? url : nil
 }
 
 // MARK: - Engine (runs on the client's queue)
@@ -284,6 +363,14 @@ final class SurveyEngine: @unchecked Sendable {
 
     func complete(_ s: ActiveSurvey) {
         if active == s.campaign.id { active = nil }
+    }
+
+    func followUp(_ s: ActiveSurvey, accepted: Bool) {
+        guard let client, let fu = s.followUp else { return }
+        var props = base(s)
+        props["study"] = .string(fu.studyId)
+        props["accepted"] = .bool(accepted)
+        client.capture(.track, "$survey_follow_up", path: s.path, properties: props)
     }
 
     func dismiss(_ s: ActiveSurvey, at index: Int) {

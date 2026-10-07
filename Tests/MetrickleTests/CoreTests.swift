@@ -201,6 +201,73 @@ final class CoreTests: XCTestCase {
         client.stopTimer()
     }
 
+    func testOptedOutFirstLaunchCreatesNoId() async {
+        let storage = MemoryStorage(["mk_optout": "1"])
+        let client = makeClient(storage: storage)
+        client.sync()
+        XCTAssertNil(storage.get("mk_aid"))
+        XCTAssertNil(client.identity.anonymousId)
+        client.stopTimer()
+    }
+
+    func testOptedOutWithStoredIdDoesNotUseIt() {
+        let storage = MemoryStorage(["mk_optout": "1", "mk_aid": "old-id"])
+        let client = makeClient(storage: storage)
+        client.sync()
+        XCTAssertNil(client.identity.anonymousId)
+        client.stopTimer()
+    }
+
+    func testOptOutRemovesStoredIdsButKeepsUserAndConsent() async {
+        let storage = MemoryStorage()
+        let client = makeClient(storage: storage)
+        client.identify("user-9")
+        client.consent(replay: true)
+        client.track("x")
+        client.sync()
+        XCTAssertNotNil(storage.get("mk_aid"))
+        XCTAssertNotNil(storage.get("mk_sid"))
+        client.q.sync { client.saveQueue() }
+        XCTAssertNotNil(storage.get("mk_queue"))
+        client.optOut()
+        client.sync()
+        XCTAssertNil(storage.get("mk_aid"))
+        XCTAssertNil(storage.get("mk_sid"))
+        XCTAssertNil(storage.get("mk_queue"))
+        XCTAssertEqual(storage.get("mk_uid"), "user-9")
+        XCTAssertEqual(storage.get("mk_consent"), "replay")
+        XCTAssertEqual(client.identity, Metrickle.Identity(anonymousId: nil, userId: "user-9", sessionId: nil))
+        client.stopTimer()
+    }
+
+    func testResetWhileOptedOutCreatesNoId() {
+        let storage = MemoryStorage()
+        let client = makeClient(storage: storage)
+        client.optOut()
+        client.reset()
+        client.sync()
+        XCTAssertNil(storage.get("mk_aid"))
+        XCTAssertNil(client.identity.anonymousId)
+        client.stopTimer()
+    }
+
+    func testOptInCreatesIdAndRefetchesConfig() async {
+        let storage = MemoryStorage(["mk_optout": "1"])
+        let transport = RecordingTransport()
+        let client = makeClient(storage: storage, transport: transport)
+        client.sync()
+        XCTAssertNil(storage.get("mk_aid"))
+        client.optIn()
+        client.sync()
+        let id = client.identity.anonymousId
+        XCTAssertNotNil(id)
+        XCTAssertEqual(storage.get("mk_aid"), id)
+        XCTAssertNil(storage.get("mk_optout"))
+        await sleep(ms: 50)
+        XCTAssertEqual(transport.requests.map { $0.url?.path }, ["/v1/config"])
+        client.stopTimer()
+    }
+
     func testSessionsTimeOutAndPassiveEventsDoNotExtend() async throws {
         let clock = TestClock(0)
         let transport = RecordingTransport()

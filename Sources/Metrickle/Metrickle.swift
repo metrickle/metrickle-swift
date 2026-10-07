@@ -3,7 +3,7 @@ import Foundation
 /// The Metrickle client. Configure once at launch, then use `Metrickle.shared` (or keep the returned instance).
 /// Every method is safe to call from any thread; work happens on a private serial queue and never blocks the caller on I/O.
 public final class Metrickle: @unchecked Sendable {
-    public static let sdkVersion = "0.1.0"
+    public static let sdkVersion = "0.2.0"
     static let libraryName = "metrickle-ios"
     static let platform = "ios"
 
@@ -176,16 +176,16 @@ public final class Metrickle: @unchecked Sendable {
         }
     }
 
-    /// Call on logout: forgets the user and session and starts a new anonymous identity.
+    /// Call on logout: forgets the user and session and starts a new anonymous identity (none while opted out).
     public func reset() {
         q.async {
             self.userId = nil
             self.session = nil
-            self.anonymousId = self.storage != nil ? Self.uuid() : nil
+            self.anonymousId = self.storage != nil && !self.optedOut ? Self.uuid() : nil
             if let s = self.storage {
                 s.remove(Keys.user)
                 s.remove(Keys.session)
-                if let id = self.anonymousId { s.set(Keys.anon, id) }
+                if let id = self.anonymousId { s.set(Keys.anon, id) } else { s.remove(Keys.anon) }
             }
         }
     }
@@ -195,20 +195,36 @@ public final class Metrickle: @unchecked Sendable {
         q.async { self.superProps.merge(properties) { $1 } }
     }
 
-    /// Stops all collection and network calls, clears the queue, and remembers the choice.
+    /// Stops all collection and network calls, clears the queue, removes the anonymous id and session from the device,
+    /// and remembers the choice. Your own user id (from `identify`) and consent are kept.
     public func optOut() {
         q.async {
             self.optedOut = true
             self.queue = []
-            self.storage?.set(Keys.optOut, "1")
-            self.storage?.remove(Keys.queue)
+            self.anonymousId = nil
+            self.session = nil
+            if let s = self.storage {
+                s.set(Keys.optOut, "1")
+                s.remove(Keys.queue)
+                s.remove(Keys.anon)
+                s.remove(Keys.session)
+            }
         }
     }
 
+    /// Resumes collection with a new anonymous id and fetches surveys and settings again.
     public func optIn() {
         q.async {
             self.optedOut = false
-            self.storage?.remove(Keys.optOut)
+            if let s = self.storage {
+                s.remove(Keys.optOut)
+                if self.anonymousId == nil {
+                    let id = Self.uuid()
+                    self.anonymousId = id
+                    s.set(Keys.anon, id)
+                }
+            }
+            self.fetchConfigLocked()
         }
     }
 
@@ -306,7 +322,10 @@ public final class Metrickle: @unchecked Sendable {
         guard let s = storage else { return }
         optedOut = s.get(Keys.optOut) == "1"
         consents = Set((s.get(Keys.consent) ?? "").split(separator: ",").map(String.init).filter { $0 == "replay" })
-        if let id = s.get(Keys.anon), !id.isEmpty {
+        if optedOut {
+            // An opted-out user gets no id on the device; optIn() creates one.
+            anonymousId = nil
+        } else if let id = s.get(Keys.anon), !id.isEmpty {
             anonymousId = id
         } else {
             let id = Self.uuid()
@@ -485,7 +504,7 @@ public final class Metrickle: @unchecked Sendable {
         return req
     }
 
-    /// `metrickle-ios/0.1.0 (iOS 17.2; iPhone15,2)`.
+    /// `metrickle-ios/0.2.0 (iOS 17.2; iPhone15,2)`.
     var userAgent: String {
         let d = context.device
         return "\(Self.libraryName)/\(Self.sdkVersion) (\(d?.os ?? "iOS") \(d?.osVersion ?? ""); \(d?.model ?? "unknown"))"
@@ -507,6 +526,36 @@ public final class Metrickle: @unchecked Sendable {
             }
             self.q.async { self.apply(cfg) }
         }
+    }
+
+    /// `POST /v1/studies/invite`: the respondent's personal study link, or nil for anything but a safe URL in a 201.
+    func requestInvite(studyId: String, campaignId: String, response: String) async -> URL? {
+        struct Body: Encodable {
+            var writeKey, studyId, campaignId, response: String
+            var anonymousId, userId: String?
+        }
+        struct Reply: Decodable { var url: String? }
+        let request: URLRequest? = await withCheckedContinuation { cont in
+            q.async {
+                guard !self.optedOut, let url = URL(string: "\(self.host)/v1/studies/invite"),
+                      let body = try? JSONEncoder().encode(Body(
+                        writeKey: self.writeKey, studyId: studyId, campaignId: campaignId, response: response,
+                        anonymousId: self.anonymousId, userId: self.userId)) else { return cont.resume(returning: nil) }
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "content-type")
+                req.setValue(self.writeKey, forHTTPHeaderField: "x-metrickle-key")
+                req.setValue(self.userAgent, forHTTPHeaderField: "User-Agent")
+                req.httpBody = body
+                cont.resume(returning: req)
+            }
+        }
+        guard let request, let (status, data) = try? await transport.send(request), status == 201,
+              let reply = try? JSONDecoder().decode(Reply.self, from: data) else {
+            log("study invite unavailable")
+            return nil
+        }
+        return safeInviteURL(reply.url, host: host)
     }
 
     func apply(_ config: SdkConfig) {

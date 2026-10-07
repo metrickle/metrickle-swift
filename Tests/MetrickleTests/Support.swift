@@ -8,6 +8,8 @@ final class RecordingTransport: HTTPTransport, @unchecked Sendable {
     private var _requests: [URLRequest] = []
     private var statuses: [Int]
     var config: Data?
+    /// Reply to `POST /v1/studies/invite`; status -1 simulates a network error.
+    var invite: (status: Int, body: Data) = (409, Data(#"{"error":"not_recruiting"}"#.utf8))
 
     init(statuses: [Int] = [], config: Data? = nil) {
         self.statuses = statuses
@@ -31,6 +33,10 @@ final class RecordingTransport: HTTPTransport, @unchecked Sendable {
             return config.map { (200, $0) } ?? (404, Data())
         case "/v1/feedback":
             return (201, Data(#"{"id":"fb_1"}"#.utf8))
+        case "/v1/studies/invite":
+            let reply = lock.withLock { invite }
+            if reply.status == -1 { throw URLError(.notConnectedToInternet) }
+            return reply
         default:
             let status = lock.withLock { statuses.isEmpty ? 200 : statuses.removeFirst() }
             if status == -1 { throw URLError(.notConnectedToInternet) }

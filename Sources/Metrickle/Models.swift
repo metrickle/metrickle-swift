@@ -193,17 +193,71 @@ public struct Targeting: Codable, Sendable, Equatable {
     }
 }
 
+/// Which answers qualify for a follow-up (`FollowUpWhen`).
+public struct FollowUpWhen: Codable, Sendable, Equatable {
+    public var questionId: String
+    /// Scores: an inclusive band, e.g. NPS detractors are 0–6.
+    public var min: Double?
+    public var max: Double?
+    /// Choice questions: any of these answers.
+    public var choices: [String]?
+
+    public init(questionId: String, min: Double? = nil, max: Double? = nil, choices: [String]? = nil) {
+        self.questionId = questionId; self.min = min; self.max = max; self.choices = choices
+    }
+}
+
+/// After the last answer, invite the respondent into a study (`FollowUpConfig`). Only sent while the study is recruiting.
+public struct FollowUpConfig: Codable, Sendable, Equatable {
+    public enum Kind: String, Codable, Sendable {
+        /// A booked video call.
+        case moderated
+        /// A self-guided test on the web.
+        case unmoderated
+    }
+
+    public var studyId: String
+    public var kind: Kind
+    public var prompt: String
+    /// Who qualifies; nil means everyone who finishes the survey.
+    public var when: FollowUpWhen?
+    public var incentive: String?
+    /// Moderated: session length in minutes.
+    public var durationMin: Int?
+
+    public init(studyId: String, kind: Kind, prompt: String, when: FollowUpWhen? = nil, incentive: String? = nil,
+                durationMin: Int? = nil) {
+        self.studyId = studyId; self.kind = kind; self.prompt = prompt; self.when = when
+        self.incentive = incentive; self.durationMin = durationMin
+    }
+}
+
 /// What the SDK receives for a campaign: only what's needed to decide and render.
 public struct CampaignConfig: Codable, Sendable, Equatable, Identifiable {
     public var id: String
     public var questions: [Question]
     public var targeting: Targeting
     public var thankYou: String?
+    /// An invite into a study after the last answer, while the study is recruiting.
+    public var followUp: FollowUpConfig?
     /// Bumps when the campaign is edited.
     public var version: Int
 
-    public init(id: String, questions: [Question], targeting: Targeting, thankYou: String? = nil, version: Int = 1) {
-        self.id = id; self.questions = questions; self.targeting = targeting; self.thankYou = thankYou; self.version = version
+    public init(id: String, questions: [Question], targeting: Targeting, thankYou: String? = nil,
+                followUp: FollowUpConfig? = nil, version: Int = 1) {
+        self.id = id; self.questions = questions; self.targeting = targeting; self.thankYou = thankYou
+        self.followUp = followUp; self.version = version
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        questions = try c.decode([Question].self, forKey: .questions)
+        targeting = try c.decode(Targeting.self, forKey: .targeting)
+        thankYou = try c.decodeIfPresent(String.self, forKey: .thankYou)
+        // A follow-up this SDK can't read (e.g. a newer study kind) is dropped; the survey itself still runs.
+        followUp = (try? c.decodeIfPresent(FollowUpConfig.self, forKey: .followUp)) ?? nil
+        version = try c.decode(Int.self, forKey: .version)
     }
 }
 
